@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>M3U8 Universal Player</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b0d10;color:#fff;font-family:Arial,system-ui,sans-serif}
+.wrap{max-width:950px;margin:auto;padding:18px}
+.card{background:#15191f;border:1px solid #303640;border-radius:18px;padding:18px}
+h1{font-size:25px;margin:0 0 16px}
+.row{display:flex;gap:9px}
+input{flex:1;min-width:0;background:#0d1014;color:#fff;border:1px solid #3a424d;border-radius:11px;padding:14px;font-size:15px}
+button,select{border:0;border-radius:11px;padding:12px 15px;font-size:15px;background:#2875f5;color:#fff}
+select{background:#252b34;border:1px solid #3b424c}
+.player{margin-top:15px;border-radius:14px;overflow:hidden;background:#000}
+video{display:block;width:100%;height:auto;min-height:220px;max-height:75vh;background:#000}
+.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+.status{margin-top:13px;min-height:48px;color:#c0c7d0;font-size:14px;line-height:1.5}
+.good{color:#7ee787}.bad{color:#ff7b72}.info{color:#79c0ff}
+.note{margin-top:7px;color:#8993a1;font-size:12px;line-height:1.5}
+@media(max-width:650px){.row{flex-direction:column}.row button{width:100%}}
+</style>
+</head>
+
+<body>
+<div class="wrap">
+<div class="card">
+<h1>M3U8 / HLS Player</h1>
+
+<div class="row">
+<input id="url" type="url" placeholder="Paste the COMPLETE .m3u8 URL">
+<button id="playBtn" type="button">PLAY</button>
+</div>
+
+<div class="player">
+<video id="video" controls playsinline preload="metadata"></video>
+</div>
+
+<div class="controls">
+<label>Quality:</label>
+<select id="quality" disabled>
+<option value="-1">Auto</option>
+</select>
+<button id="reloadBtn" type="button">RELOAD</button>
+<button id="fullBtn" type="button">FULLSCREEN</button>
+<button id="testBtn" type="button">TEST</button>
+</div>
+
+<div id="status" class="status info">
+Ready. Paste the COMPLETE M3U8 URL.
+</div>
+
+<div class="note">
+Important: a website/domain such as https://example.com is NOT an M3U8 URL.
+The URL must normally end in .m3u8 (or contain .m3u8 before its query string).
+</div>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.13/dist/hls.min.js"></script>
+<script>
+"use strict";
+
+var video = document.getElementById("video");
+var input = document.getElementById("url");
+var quality = document.getElementById("quality");
+var statusBox = document.getElementById("status");
+
+var hls = null;
+var lastURL = "";
+
+function setStatus(text, cls){
+  statusBox.className = "status " + (cls || "info");
+  statusBox.innerHTML = text;
+}
+
+function clearPlayer(){
+  if(hls){
+    try{ hls.destroy(); }catch(e){}
+    hls = null;
+  }
+  try{ video.pause(); }catch(e){}
+  video.removeAttribute("src");
+  video.load();
+  quality.innerHTML = '<option value="-1">Auto</option>';
+  quality.disabled = true;
+}
+
+function looksLikeM3U8(url){
+  return /\.m3u8(?:[?#]|$)/i.test(url);
+}
+
+function playNative(url){
+  return new Promise(function(resolve,reject){
+    var finished = false;
+
+    function cleanup(){
+      video.removeEventListener("loadedmetadata", ok);
+      video.removeEventListener("error", bad);
+    }
+    function ok(){
+      if(finished)return;
+      finished=true;
+      cleanup();
+      setStatus("✓ Stream loaded using the browser's native HLS.", "good");
+      video.play().catch(function(){});
+      resolve();
+    }
+    function bad(){
+      if(finished)return;
+      finished=true;
+      cleanup();
+      reject(new Error("native playback failed"));
+    }
+
+    video.addEventListener("loadedmetadata", ok);
+    video.addEventListener("error", bad);
+
+    video.src = url;
+    video.load();
+  });
+}
+
+function playHls(url){
+  return new Promise(function(resolve,reject){
+    if(!window.Hls || !Hls.isSupported()){
+      reject(new Error("HLS.js unavailable"));
+      return;
+    }
+
+    hls = new Hls({
+      enableWorker:true,
+      lowLatencyMode:true,
+      backBufferLength:60,
+      capLevelToPlayerSize:false
+    });
+
+    var rejected = false;
+
+    hls.on(Hls.Events.ERROR, function(event, data){
+      if(!data.fatal)return;
+
+      if(data.type === Hls.ErrorTypes.MEDIA_ERROR){
+        setStatus("⚠ Media error. Attempting recovery...", "info");
+        try{ hls.recoverMediaError(); }catch(e){}
+      }else{
+        if(!rejected){
+          rejected = true;
+          reject(new Error(data.details || "network/playlist error"));
+        }
+      }
+    });
+
+    hls.on(Hls.Events.MANIFEST_LOADING, function(){
+      setStatus("⏳ Requesting M3U8 playlist...", "info");
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, function(){
+      quality.innerHTML = '<option value="-1">Auto</option>';
+
+      for(var i=0;i<hls.levels.length;i++){
+        var level = hls.levels[i];
+        var option = document.createElement("option");
+        option.value = i;
+
+        var label = level.height ? level.height + "p" : "Level " + (i+1);
+        if(level.bitrate){
+          label += " • " + Math.round(level.bitrate/1000) + " kbps";
+        }
+
+        option.textContent = label;
+        quality.appendChild(option);
+      }
+
+      quality.disabled = hls.levels.length === 0;
+      setStatus("✓ Playlist loaded. " + hls.levels.length + " quality level(s) found.", "good");
+      video.play().catch(function(){});
+
+      if(!rejected){
+        rejected = true;
+        resolve();
+      }
+    });
+
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MEDIA_ATTACHED, function(){
+      try{
+        hls.loadSource(url);
+      }catch(e){
+        reject(e);
+      }
+    });
+  });
+}
+
+async function start(){
+  var url = input.value.trim();
+
+  if(!url){
+    setStatus("❌ URL box is empty.", "bad");
+    return;
+  }
+
+  if(!/^https?:\/\//i.test(url)){
+    setStatus("❌ URL must start with http:// or https://", "bad");
+    return;
+  }
+
+  /*
+   * This catches the exact problem shown in the screenshot:
+   * the user entered only the website/CDN domain, not the playlist URL.
+   */
+  if(!looksLikeM3U8(url)){
+    setStatus(
+      "❌ This is NOT an M3U8 playlist URL.<br>" +
+      "You entered a website/CDN address. Paste the COMPLETE URL containing <b>.m3u8</b>.",
+      "bad"
+    );
+    return;
+  }
+
+  lastURL = url;
+  clearPlayer();
+
+  var nativeHls = video.canPlayType("application/vnd.apple.mpegurl");
+
+  /* Native HLS first where it is genuinely supported (many TVs/Safari). */
+  if(nativeHls){
+    setStatus("⏳ Trying native HLS...", "info");
+    try{
+      await playNative(url);
+      return;
+    }catch(e){}
+  }
+
+  /* HLS.js for Chrome/Android/desktop. */
+  if(window.Hls && Hls.isSupported()){
+    try{
+      await playHls(url);
+      return;
+    }catch(e){
+      if(hls){
+        try{hls.destroy();}catch(x){}
+        hls=null;
+      }
+
+      setStatus(
+        "❌ Browser could not load this M3U8.<br>" +
+        "Possible causes: CORS blocked, expired/signed URL, or unavailable playlist/segments.",
+        "bad"
+      );
+      return;
+    }
+  }
+
+  setStatus("❌ This browser has no usable HLS support.", "bad");
+}
+
+document.getElementById("playBtn").onclick = start;
+
+input.addEventListener("keydown", function(e){
+  if(e.key === "Enter") start();
+});
+
+document.getElementById("reloadBtn").onclick = function(){
+  if(lastURL){
+    input.value = lastURL;
+    start();
+  }else{
+    setStatus("Nothing to reload.", "info");
+  }
+};
+
+document.getElementById("testBtn").onclick = function(){
+  /*
+   * Public test playlist. This is useful only to test the PLAYER itself.
+   * It does not test your own CDN.
+   */
+  input.value = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+  start();
+};
+
+quality.onchange = function(){
+  if(!hls)return;
+
+  hls.currentLevel = Number(quality.value);
+
+  if(quality.value === "-1"){
+    setStatus("Quality: Auto", "info");
+  }else{
+    setStatus(
+      "Quality: " +
+      quality.options[quality.selectedIndex].text,
+      "info"
+    );
+  }
+};
+
+document.getElementById("fullBtn").onclick = function(){
+  try{
+    if(document.fullscreenElement){
+      document.exitFullscreen();
+    }else if(video.requestFullscreen){
+      video.requestFullscreen();
+    }else if(video.webkitEnterFullscreen){
+      video.webkitEnterFullscreen();
+    }else{
+      video.parentElement.requestFullscreen();
+    }
+  }catch(e){}
+};
+</script>
+</body>
+</html>
